@@ -2,7 +2,8 @@
 import EventEmitter from 'eventemitter3';
 import memoize from 'memoizerific';
 import debounce from 'lodash/debounce';
-import { stripIndents } from 'common-tags';
+import dedent from 'ts-dedent';
+import stable from 'stable';
 
 import { Channel } from '@storybook/channels';
 import Events from '@storybook/core-events';
@@ -34,6 +35,9 @@ const getId = (): number => {
 const toExtracted = <T>(obj: T) =>
   Object.entries(obj).reduce((acc, [key, value]) => {
     if (typeof value === 'function') {
+      return acc;
+    }
+    if (key === 'hooks') {
       return acc;
     }
     if (Array.isArray(value)) {
@@ -118,7 +122,7 @@ export default class StoryStore extends EventEmitter {
 
   extract(options?: StoryOptions) {
     const stories = Object.entries(this._data);
-    // determine if we should apply a sort to the stories or just use default import order
+    // determine if we should apply a sort to the stories or use default import order
     if (Object.values(this._data).length > 0) {
       const index = Object.keys(this._data).find(
         key =>
@@ -126,7 +130,20 @@ export default class StoryStore extends EventEmitter {
       );
       if (index && this._data[index].parameters.options.storySort) {
         const sortFn = this._data[index].parameters.options.storySort;
-        stories.sort(sortFn);
+        stable.inplace(stories, sortFn);
+      } else {
+        // NOTE: when kinds are HMR'ed they get temporarily removed from the `_data` array
+        // and thus lose order. However in `_legacydata` they just get zeroed out, meaning
+        // that the order is preserved. Here we can use this to preserve the load
+        // order if there is no sort function, although it's a hack.
+        const kindOrder = Object.keys(this._legacydata).reduce(
+          (acc: Record<string, number>, kind: string, idx: number) => {
+            acc[kind] = idx;
+            return acc;
+          },
+          {}
+        );
+        stable.inplace(stories, (s1, s2) => kindOrder[s1[1].kind] - kindOrder[s2[1].kind]);
       }
     }
     // removes function values from all stories so they are safe to transport over the channel
@@ -141,9 +158,16 @@ export default class StoryStore extends EventEmitter {
       data === undefined ? this._selection : { storyId: data.storyId, viewMode: data.viewMode };
     this._error = error === undefined ? this._error : error;
 
+    // Try and emit the STORY_RENDER event synchronously, but if the channel is not ready (RN),
+    // we'll try again later.
+    let isStarted = false;
+    if (this._channel) {
+      this._channel.emit(Events.STORY_RENDER);
+      isStarted = true;
+    }
+
     setTimeout(() => {
-      // preferred method to emit event.
-      if (this._channel) {
+      if (this._channel && !isStarted) {
         this._channel.emit(Events.STORY_RENDER);
       }
 
@@ -162,6 +186,7 @@ export default class StoryStore extends EventEmitter {
     delete _data[id];
 
     if (story) {
+      story.hooks.clean();
       const { kind, name } = story;
       const kindData = this._legacydata[toKey(kind)];
       if (kindData) {
@@ -183,11 +208,11 @@ export default class StoryStore extends EventEmitter {
     const { _data } = this;
 
     if (_data[id]) {
-      logger.warn(stripIndents`
+      logger.warn(dedent`
         Story with id ${id} already exists in the store!
 
         Perhaps you added the same story twice, or you have a name collision?
-        Story ids need to be unique -- ensure you aren't using the same names modolo url-sanitization.
+        Story ids need to be unique -- ensure you aren't using the same names modulo url-sanitization.
       `);
     }
 
@@ -357,7 +382,7 @@ export default class StoryStore extends EventEmitter {
   removeStoryKind(kind: string) {
     if (this.hasStoryKind(kind)) {
       this._legacydata[toKey(kind)].stories = {};
-
+      this.cleanHooksForKind(kind);
       this._data = Object.entries(this._data).reduce((acc, [id, story]) => {
         if (story.kind !== kind) {
           Object.assign(acc, { [id]: story });
@@ -394,7 +419,9 @@ export default class StoryStore extends EventEmitter {
   }
 
   cleanHooks(id: string) {
-    this._data[id].hooks.clean();
+    if (this._data[id]) {
+      this._data[id].hooks.clean();
+    }
   }
 
   cleanHooksForKind(kind: string) {
